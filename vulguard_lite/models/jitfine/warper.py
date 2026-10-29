@@ -1,0 +1,341 @@
+import json, torch, os
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from transformers import get_linear_schedule_with_warmup, RobertaConfig, RobertaTokenizer, RobertaModel
+
+from ..BaseWraper import BaseWraper
+
+from .model import Model
+from .dataset import TextDataset
+
+from sklearn.metrics import precision_recall_curve, auc
+
+def get_auc(ground_truth, predict):
+    precisions, recalls, _ = precision_recall_curve(y_true=ground_truth, y_score=predict)
+    pr_auc = auc(recalls, precisions)
+    
+    return pr_auc
+
+class JITFine(BaseWraper):
+    def __init__(self, language, device="cpu", **kwarg):
+        self.model_name = 'jitfine'
+        self.language = language
+        self.initialized = False
+        self.model = None
+        self.device = device
+        self.hyperparameters = None 
+
+        self.optimizer = None
+        self.scheduler = None
+        self._scheduler_state_dict = None
+        self.epoch = 0
+        self.step = 0
+        self.patience = 0
+        self.best_pr_auc = 0
+        
+        self.config = None
+        self.tokenizer = None
+        self.encoder = None
+        
+        self.val_dataloader = None
+                
+        self.default_input = "Kamei_features,merge"  # train / val file prefixes
+        self.default_test_input = "tlel,deepjit"       # test file prefixes (test_tlel + test_deepjit)
+
+    def __call__(self, message, code):
+        return self.model(message, code)
+    
+    def get_parameters(self):
+        return self.model.parameters()
+    
+    def set_device(self, device):
+        self.device = device
+    
+    def initialize(self, hyperparameters, model_path=None, inference_only=False,
+                   attention_implementation=None, **kwarg):
+        # Load hyperparameter
+        with open(hyperparameters, 'r') as file:
+            self.hyperparameters = json.load(file)
+            
+        # Init config
+        self.config = RobertaConfig.from_pretrained(self.hyperparameters["config_name"] if self.hyperparameters["config_name"] else self.hyperparameters["model_name_or_path"])    
+        self.config.num_labels = self.hyperparameters["num_labels"]
+        self.config.feature_size = self.hyperparameters["feature_size"]
+        self.config.hidden_dropout_prob = self.hyperparameters["head_dropout_prob"]
+
+        # Init tokenizer
+        self.tokenizer = RobertaTokenizer.from_pretrained(self.hyperparameters["tokenizer_name"])
+        special_tokens_dict = {'additional_special_tokens': ["<ADD>", "<REMOVE>"]}
+        self.tokenizer.add_special_tokens(special_tokens_dict)
+
+        # Init encoder
+        encoder_kwargs = {"config": self.config}
+        if attention_implementation is not None:
+            encoder_kwargs["attn_implementation"] = attention_implementation
+        self.encoder = RobertaModel.from_pretrained(
+            self.hyperparameters["model_name_or_path"],
+            **encoder_kwargs,
+        )
+        self.encoder.resize_token_embeddings(len(self.tokenizer))
+        
+        # Init model
+        self.model = Model(self.encoder, self.config, self.tokenizer, self.hyperparameters).to(device=self.device)
+        
+        if not inference_only:
+            # Optimizer state is needed for training/resume, but attribution and
+            # evaluation only require model weights.
+            no_decay = ['bias', 'LayerNorm.weight']
+
+            optimizer_grouped_parameters = [
+                {
+                    'params': [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
+                    'weight_decay': self.hyperparameters["weight_decay"]
+                },
+                {
+                    'params': [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
+                    'weight_decay': 0.0
+                },
+            ]
+            self.optimizer = torch.optim.AdamW(
+                optimizer_grouped_parameters,
+                lr=self.hyperparameters["train"]["learning_rate"],
+                eps=self.hyperparameters["adam_epsilon"],
+            )
+        
+        
+        if model_path is not None:
+            checkpoint_path = model_path
+            if not os.path.isfile(checkpoint_path):
+                checkpoint_path = os.path.join(model_path, "jitfine_checkpoint_last.pth")
+                if not os.path.exists(checkpoint_path):
+                    checkpoint_path = os.path.join(model_path, "jitfine.pth")
+            # JITFine checkpoints contain optimizer and scheduler state in
+            # addition to tensor weights.  PyTorch 2.6 changed torch.load's
+            # default to weights_only=True, which rejects metadata (including
+            # NumPy scalars) found in checkpoints created by older runs.
+            # Checkpoints used here must therefore come from a trusted source.
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location=self.device,
+                weights_only=False,
+            )
+            model_state = checkpoint.get('model_state_dict', checkpoint)
+            self.model.load_state_dict(model_state)
+            if not inference_only:
+                if 'model_state_dict' not in checkpoint:
+                    raise ValueError("training resume requires a full JITFine checkpoint")
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self._scheduler_state_dict = checkpoint.get("scheduler_state_dict")
+                self.epoch = checkpoint['epoch']
+                self.step = checkpoint['step']
+                self.patience = checkpoint["patience"]
+                self.best_pr_auc = checkpoint.get("best_pr_auc", 0)
+            print(f"Loaded checkpoint from: {checkpoint_path}")
+
+        # Set initialized to True
+        self.initialized = True
+    
+    def preprocess(self, data_path, mode="train", **kwarg):
+        feature_path, code_path = data_path.split(",")
+        
+        dataset = TextDataset(tokenizer=self.tokenizer, hyperparameters=self.hyperparameters, changes_filename=code_path, features_filename=feature_path, mode=mode)
+        if mode == "train":
+            sampler = RandomSampler(dataset)
+        elif mode == "test" or mode == "val":
+            sampler = SequentialSampler(dataset)
+        
+        return dataset, sampler
+    
+        
+    def postprocess(self, commit_ids, outputs, threshold, labels=None, **kwargs):
+        result = pd.DataFrame({
+            "commit_id": commit_ids,
+            "probability": outputs,
+        })
+        result["prediction"] = (result["probability"] > threshold).astype(float)
+        
+        if labels is not None:
+            result["label"] = labels
+
+        return result
+
+    def inference(self, infer_df, threshold, eval_dataloader= None, **kwarg):
+        if eval_dataloader is None:
+            eval_dataset, eval_sampler = self.preprocess(infer_df, mode="test", **kwarg)
+            eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=self.hyperparameters["test"]["eval_batch_size"])
+        
+        # Eval!
+        print("***** Running evaluation *****")
+        # print("  Num examples = %d", len(eval_dataset))
+        # print("  Batch size = %d", self.hyperparameters[mode]["eval_batch_size"])
+
+        eval_loss = 0.0
+        self.model.eval()
+        commit_ids = []
+        logits = []
+        y_trues = []
+        
+        bar = tqdm(eval_dataloader, total=len(eval_dataloader))
+        for batch in bar:
+            commit_id, input_ids, attn_masks, manual_features, labels = batch
+            input_ids = input_ids.to(self.device)
+            attn_masks = attn_masks.to(self.device)
+            manual_features = manual_features.to(self.device)
+            labels = labels.to(self.device)
+
+            with torch.no_grad():
+                if labels is not None:
+                    loss, logit, _ = self.model(input_ids, attn_masks, manual_features, labels)
+                    eval_loss += loss.mean().item()
+                else:
+                    logit = self.model(input_ids, attn_masks, manual_features, labels)
+                    
+                torch.cuda.empty_cache()
+                logits.append(logit.cpu().numpy())
+                commit_ids.append(commit_id)
+                y_trues.append(labels.cpu().numpy() if labels is not None else None)
+            bar.update()
+            
+        # calculate scores
+        logits = np.concatenate(logits, 0).reshape(-1)    # (N,1) or (N,) → (N,)
+        commit_ids = np.concatenate(commit_ids, 0)
+        y_trues = np.concatenate(y_trues, 0).reshape(-1)  # (N,1) or (N,) → (N,)
+
+        y_trues = y_trues if y_trues[0] is not None else None
+        
+        final_prediction = self.postprocess(commit_ids=commit_ids, outputs=logits, threshold=threshold, labels=y_trues)
+        return final_prediction
+        
+    def train(self, train_df, val_df, **kwarg):
+        params = kwarg.get("params")
+        save_path = kwarg.get("save_path")
+        threshold = 0.5 if params.threshold is None else params.threshold
+        
+        train_dataset, train_sampler = self.preprocess(train_df, mode="train", **kwarg)
+        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=self.hyperparameters["train"]["train_batch_size"])
+        
+        val_dataset, val_sampler = self.preprocess(val_df, mode="val", **kwarg)
+        val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=self.hyperparameters["train"]["eval_batch_size"])
+        val_ground_truth = None  # derived from inference output to guarantee alignment
+        
+        if self.hyperparameters["max_steps"] > 0:
+            max_steps =  self.hyperparameters["max_steps"]
+        else:
+            max_steps = self.hyperparameters["epochs"] * len(train_dataloader) if params.epochs is None else params.epochs * len(train_dataloader)
+        
+        save_steps = max(len(train_dataloader) // 5, 1)
+        warmup_steps = self.hyperparameters["warmup_steps"]
+        total_epochs = self.hyperparameters["epochs"] if params.epochs is None else params.epochs
+
+        # Prepare optimizer and schedule (linear warmup and decay)
+        
+        if self.scheduler is None:
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer, 
+                num_warmup_steps=warmup_steps,
+                num_training_steps=max_steps
+            )
+            if self._scheduler_state_dict is not None:
+                self.scheduler.load_state_dict(self._scheduler_state_dict)
+                self._scheduler_state_dict = None
+
+        # Train!
+        print("***** Running training *****")
+        print("  Num examples = ", len(train_dataset))
+        print("  Num Epochs = ", total_epochs)
+        print("  Instantaneous batch size per GPU = ", self.hyperparameters["train"]["train_batch_size"])
+        print("  Total train batch size = ", self.hyperparameters["train"]["train_batch_size"] * self.hyperparameters["gradient_accumulation_steps"])
+        print("  Gradient Accumulation steps = ", self.hyperparameters["gradient_accumulation_steps"])
+        print("  Total optimization steps = ", max_steps)
+
+        checkpoint_path = kwarg.get("checkpoint_path")
+        global_step = self.step
+        self.model.zero_grad()
+
+        for idx in range(self.epoch, total_epochs):
+            bar = tqdm(train_dataloader, total=len(train_dataloader))
+            tr_loss = 0
+            tr_num = 0
+            for step, batch in enumerate(bar):
+                commit_id, input_ids, attn_masks, manual_features, labels = batch
+                input_ids = input_ids.to(self.device)
+                attn_masks = attn_masks.to(self.device)
+                manual_features = manual_features.to(self.device)
+                labels = labels.to(self.device)
+                self.model.train()
+                loss, logits, _ = self.model(input_ids, attn_masks, manual_features, labels)
+                
+                if self.hyperparameters["gradient_accumulation_steps"] > 1:
+                    loss = loss / self.hyperparameters["gradient_accumulation_steps"]
+
+                # report loss
+                tr_loss += loss.item()
+                tr_num += 1
+                if (step + 1) % save_steps == 0:
+                    print("Epoch {} step {} loss {}".format(idx, step + 1, round(tr_loss / tr_num, 5)))
+                    tr_loss = 0
+                    tr_num = 0
+
+                # backward
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.hyperparameters["max_grad_norm"])
+
+                if (step + 1) % self.hyperparameters["gradient_accumulation_steps"] == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
+
+                global_step += 1
+                if (step + 1) % save_steps == 0:
+                    prediction = self.inference(infer_df=val_df, threshold=threshold, eval_dataloader= val_dataloader,**kwarg)
+                    val_predict = prediction.loc[:, "probability"]
+                    val_ground_truth = prediction.loc[:, "label"].tolist() if "label" in prediction.columns else val_ground_truth
+
+                    pr_auc = get_auc(val_ground_truth, val_predict)
+                    # Save model checkpoint
+                    if pr_auc > self.best_pr_auc:
+                        self.best_pr_auc = pr_auc
+                        print("  " + "*" * 20)
+                        print("  Best pr_auc: %s", round(self.best_pr_auc, 4))
+                        print("  " + "*" * 20)
+                        self.patience = 0
+                        
+                        # save
+                        self.save(f"{save_path}")
+                        print(f"Saving best model checkpoint to {save_path}")
+                    else:
+                        self.patience += 1
+                        if self.patience > self.hyperparameters["train"]["patience"] * 5:
+                            print('Patience greater than {}, early stop!'.format(5 * self.patience))
+                            return
+                bar.update()            
+
+            self.epoch = idx + 1
+            self.step = global_step
+            if checkpoint_path is not None:
+                self.save(
+                    checkpoint_path,
+                    file_name=f"{self.model_name}_checkpoint_last.pth",
+                )
+
+        self.save(f"{save_path}")
+        print(f"Saving last model checkpoint to {save_path}")
+    
+    def save(self, save_path, **kwarg):
+        os.makedirs(save_path, exist_ok=True)
+        
+        file_name = kwarg.get("file_name", "jitfine.pth")
+        save_path = os.path.join(save_path, file_name)
+        torch.save({
+            'epoch': self.epoch,
+            'step': self.step,
+            'patience': self.patience,
+            'best_pr_auc': self.best_pr_auc,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict()
+        }, save_path)
+
